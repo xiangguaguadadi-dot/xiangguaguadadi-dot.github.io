@@ -1,9 +1,14 @@
 const STORAGE_PREFIX = "agent-research-atlas.ai.";
 const API_KEY_STORAGE = `${STORAGE_PREFIX}api-key`;
 const MODEL_STORAGE = `${STORAGE_PREFIX}model`;
+const ENDPOINT_STORAGE = `${STORAGE_PREFIX}endpoint`;
+const API_MODE_STORAGE = `${STORAGE_PREFIX}api-mode`;
 const SAFETY_ID_STORAGE = `${STORAGE_PREFIX}safety-id`;
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_CHAT_COMPLETIONS_URL =
+  "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-5.6-terra";
+const DEFAULT_API_MODE = "responses";
 
 const ASSISTANT_INSTRUCTIONS = [
   "你是严谨的学术论文阅读助手，默认使用中文回答。",
@@ -56,6 +61,16 @@ export function extractResponseText(payload) {
       }
     }
   }
+
+  const chatContent = payload?.choices?.[0]?.message?.content;
+  if (typeof chatContent === "string") {
+    chunks.push(chatContent);
+  } else if (Array.isArray(chatContent)) {
+    for (const part of chatContent) {
+      if (typeof part?.text === "string") chunks.push(part.text);
+    }
+  }
+
   return chunks.join("\n").trim();
 }
 
@@ -72,25 +87,23 @@ export function formatApiError(payload, status) {
     return "这个 API Key 没有调用所选模型的权限，请更换模型或检查项目权限。";
   }
   if (status === 429) {
-    return "调用频率、余额或项目额度已达到限制，请稍后重试或检查 OpenAI API 账户。";
+    return "调用频率、余额或项目额度已达到限制，请稍后重试或检查 API 账户。";
   }
   if (status >= 500) {
-    return "OpenAI 服务暂时不可用，请稍后再试。";
+    return "API 服务暂时不可用，请稍后再试。";
   }
   return message
-    ? `OpenAI 返回错误：${message}`
+    ? `API 返回错误：${message}`
     : `请求失败（HTTP ${status || "unknown"}）。`;
 }
 
-export function buildInitialPayload({
-  model,
+export function buildPaperPrompt({
   title,
   summary,
   article,
   sources,
-  safetyId,
 }) {
-  const context = [
+  return [
     "下面是当前论文页面的完整文字上下文。",
     `论文标题：${title}`,
     `页面概要：${summary || "页面未提供单独概要"}`,
@@ -107,6 +120,17 @@ export function buildInitialPayload({
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+export function buildInitialPayload({
+  model,
+  title,
+  summary,
+  article,
+  sources,
+  safetyId,
+}) {
+  const context = buildPaperPrompt({ title, summary, article, sources });
 
   return {
     model: model || DEFAULT_MODEL,
@@ -116,6 +140,47 @@ export function buildInitialPayload({
     reasoning: { effort: "low" },
     text: { verbosity: "medium" },
     safety_identifier: safetyId,
+  };
+}
+
+export function buildResponsesReplayPayload({
+  model,
+  contextPrompt,
+  history,
+  safetyId,
+}) {
+  return {
+    model: model || DEFAULT_MODEL,
+    instructions: ASSISTANT_INSTRUCTIONS,
+    input: [
+      { role: "user", content: contextPrompt },
+      ...history.map((entry) => ({
+        role: entry.role,
+        content: entry.text,
+      })),
+    ],
+    store: true,
+    reasoning: { effort: "low" },
+    text: { verbosity: "medium" },
+    safety_identifier: safetyId,
+  };
+}
+
+export function buildChatCompletionsPayload({
+  model,
+  contextPrompt,
+  history = [],
+}) {
+  return {
+    model: model || DEFAULT_MODEL,
+    messages: [
+      { role: "system", content: ASSISTANT_INSTRUCTIONS },
+      { role: "user", content: contextPrompt },
+      ...history.map((entry) => ({
+        role: entry.role,
+        content: entry.text,
+      })),
+    ],
   };
 }
 
@@ -135,6 +200,29 @@ export function buildFollowUpPayload({
     text: { verbosity: "medium" },
     safety_identifier: safetyId,
   };
+}
+
+export function normalizeApiEndpoint(value) {
+  let url;
+  try {
+    url = new URL(String(value || "").trim());
+  } catch {
+    throw new Error("请输入完整的 API URL，例如 https://api.example.com/v1/responses。");
+  }
+
+  const isLocalhost =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]";
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLocalhost)) {
+    throw new Error("API URL 必须使用 HTTPS；本机 localhost 调试可使用 HTTP。");
+  }
+  if (url.username || url.password) {
+    throw new Error("API URL 不能包含用户名或密码。");
+  }
+
+  url.hash = "";
+  return url.toString();
 }
 
 function readPaperContext(root) {
@@ -202,7 +290,7 @@ function clearAtlasSession(storage) {
   }
 }
 
-async function callOpenAI(apiKey, body, signal) {
+async function callModelApi(apiKey, endpoint, body, signal) {
   const transportController = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => transportController.abort();
@@ -214,7 +302,7 @@ async function callOpenAI(apiKey, body, signal) {
 
   let response;
   try {
-    response = await fetch(OPENAI_RESPONSES_URL, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -225,11 +313,11 @@ async function callOpenAI(apiKey, body, signal) {
     });
   } catch (error) {
     if (timedOut) {
-      throw new Error("连接 OpenAI API 超时，请检查网络后重试。");
+      throw new Error("连接 API 服务超时，请检查 URL 与网络后重试。");
     }
     if (signal?.aborted || error?.name === "AbortError") throw error;
     throw new Error(
-      "浏览器无法连接 OpenAI API。请检查网络、浏览器隐私设置或跨域限制后重试。",
+      "浏览器无法连接该 API。请检查 URL、网络和第三方服务的跨域设置。",
     );
   } finally {
     window.clearTimeout(timeout);
@@ -267,7 +355,11 @@ function mountAssistant(root) {
   const setup = root.querySelector("[data-ai-setup]");
   const chat = root.querySelector("[data-ai-chat]");
   const keyInput = root.querySelector("[data-ai-key]");
-  const modelSelect = root.querySelector("[data-ai-model]");
+  const endpointInput = root.querySelector("[data-ai-endpoint]");
+  const modeSelect = root.querySelector("[data-ai-mode]");
+  const modelInput = root.querySelector("[data-ai-model]");
+  const targetPreview = root.querySelector("[data-ai-target-preview]");
+  const chatTarget = root.querySelector("[data-ai-chat-target]");
   const connectButton = root.querySelector("[data-ai-connect]");
   const setupError = root.querySelector("[data-ai-setup-error]");
   const status = root.querySelector("[data-ai-status]");
@@ -286,7 +378,10 @@ function mountAssistant(root) {
     !setup ||
     !chat ||
     !keyInput ||
-    !modelSelect ||
+    !endpointInput ||
+    !modeSelect ||
+    !modelInput ||
+    !targetPreview ||
     !connectButton ||
     !setupError ||
     !status ||
@@ -300,17 +395,43 @@ function mountAssistant(root) {
 
   let apiKey = storage?.getItem(API_KEY_STORAGE) || "";
   let model = storage?.getItem(MODEL_STORAGE) || DEFAULT_MODEL;
+  let endpoint =
+    storage?.getItem(ENDPOINT_STORAGE) || DEFAULT_RESPONSES_URL;
+  let apiMode =
+    storage?.getItem(API_MODE_STORAGE) || DEFAULT_API_MODE;
   let safetyId = storage?.getItem(SAFETY_ID_STORAGE) || randomSafetyId();
   let responseId = storage?.getItem(responseStorageKey(slug)) || "";
   let history = readHistory(storage, slug);
   let busy = false;
   let requestController = null;
 
-  if (!Array.from(modelSelect.options).some((option) => option.value === model)) {
-    model = DEFAULT_MODEL;
+  if (apiMode !== "responses" && apiMode !== "chat-completions") {
+    apiMode = DEFAULT_API_MODE;
   }
-  modelSelect.value = model;
+  try {
+    endpoint = normalizeApiEndpoint(endpoint);
+  } catch {
+    endpoint = DEFAULT_RESPONSES_URL;
+  }
+  endpointInput.value = endpoint;
+  modeSelect.value = apiMode;
+  modelInput.value = model;
   storage?.setItem(SAFETY_ID_STORAGE, safetyId);
+
+  function endpointLabel() {
+    try {
+      const url = new URL(endpointInput.value.trim());
+      return `${url.host}${url.pathname}`;
+    } catch {
+      return "等待填写有效 URL";
+    }
+  }
+
+  function updateTargetPreview() {
+    targetPreview.textContent = `论文、问题与 Key 将发送到：${endpointLabel()}`;
+  }
+
+  updateTargetPreview();
 
   function setOpen(open) {
     root.classList.toggle("is-open", open);
@@ -327,6 +448,11 @@ function mountAssistant(root) {
     setup.hidden = connected;
     chat.hidden = !connected;
     root.classList.toggle("is-connected", connected);
+    if (chatTarget) {
+      chatTarget.textContent = connected
+        ? `当前接口：${endpointLabel()} · ${model}。`
+        : "";
+    }
   }
 
   function setStatus(message, state = "ready") {
@@ -415,16 +541,26 @@ function mountAssistant(root) {
     requestController = new AbortController();
 
     try {
-      const result = await callOpenAI(
+      const contextPrompt = buildPaperPrompt(context);
+      const body =
+        apiMode === "chat-completions"
+          ? buildChatCompletionsPayload({
+              model,
+              contextPrompt,
+              history: [],
+            })
+          : buildInitialPayload({
+              model,
+              ...context,
+              safetyId,
+            });
+      const result = await callModelApi(
         apiKey,
-        buildInitialPayload({
-          model,
-          ...context,
-          safetyId,
-        }),
+        endpoint,
+        body,
         requestController.signal,
       );
-      responseId = result.id;
+      responseId = apiMode === "responses" ? result.id : "";
       history = [{ role: "assistant", text: result.text }];
       saveConversation();
       renderHistory();
@@ -462,17 +598,35 @@ function mountAssistant(root) {
     requestController = new AbortController();
 
     try {
-      const result = await callOpenAI(
+      const context = readPaperContext(root);
+      const contextPrompt = buildPaperPrompt(context);
+      const body =
+        apiMode === "chat-completions"
+          ? buildChatCompletionsPayload({
+              model,
+              contextPrompt,
+              history,
+            })
+          : responseId
+            ? buildFollowUpPayload({
+                model,
+                question: trimmed,
+                responseId,
+                safetyId,
+              })
+            : buildResponsesReplayPayload({
+                model,
+                contextPrompt,
+                history,
+                safetyId,
+              });
+      const result = await callModelApi(
         apiKey,
-        buildFollowUpPayload({
-          model,
-          question: trimmed,
-          responseId,
-          safetyId,
-        }),
+        endpoint,
+        body,
         requestController.signal,
       );
-      responseId = result.id;
+      responseId = apiMode === "responses" ? result.id : "";
       history.push({ role: "assistant", text: result.text });
       saveConversation();
       renderMessage({ role: "assistant", text: result.text });
@@ -488,16 +642,37 @@ function mountAssistant(root) {
   function handleConnect() {
     const enteredKey = keyInput.value.trim();
     setupError.textContent = "";
-    if (enteredKey.length < 20 || /\s/.test(enteredKey)) {
-      setupError.textContent = "请输入完整、无空格的 OpenAI API Key。";
+    if (enteredKey.length < 4 || /\s/.test(enteredKey)) {
+      setupError.textContent = "请输入完整、无空格的 API Key。";
       keyInput.focus();
       return;
     }
 
+    let enteredEndpoint;
+    try {
+      enteredEndpoint = normalizeApiEndpoint(endpointInput.value);
+    } catch (error) {
+      setupError.textContent = error.message;
+      endpointInput.focus();
+      return;
+    }
+
+    const enteredModel = modelInput.value.trim();
+    if (!enteredModel || enteredModel.length > 200 || /\s/.test(enteredModel)) {
+      setupError.textContent = "请输入有效、无空格的模型 ID。";
+      modelInput.focus();
+      return;
+    }
+
     apiKey = enteredKey;
-    model = modelSelect.value || DEFAULT_MODEL;
+    endpoint = enteredEndpoint;
+    apiMode = modeSelect.value;
+    model = enteredModel;
     storage?.setItem(API_KEY_STORAGE, apiKey);
     storage?.setItem(MODEL_STORAGE, model);
+    storage?.setItem(ENDPOINT_STORAGE, endpoint);
+    storage?.setItem(API_MODE_STORAGE, apiMode);
+    endpointInput.value = endpoint;
     keyInput.value = "";
     setConnected(true);
     initializePaper();
@@ -531,13 +706,34 @@ function mountAssistant(root) {
     responseId = "";
     history = [];
     safetyId = randomSafetyId();
+    endpoint = DEFAULT_RESPONSES_URL;
+    apiMode = DEFAULT_API_MODE;
+    model = DEFAULT_MODEL;
     messagesNode.replaceChildren();
     keyInput.value = "";
+    endpointInput.value = endpoint;
+    modeSelect.value = apiMode;
+    modelInput.value = model;
+    updateTargetPreview();
     setupError.textContent = "";
     setBusy(false);
     setConnected(false);
     setStatus("已清除本标签页中的 Key 与对话", "ready");
     keyInput.focus();
+  }
+
+  function handleModeChange() {
+    const currentEndpoint = endpointInput.value.trim();
+    if (
+      currentEndpoint === DEFAULT_RESPONSES_URL ||
+      currentEndpoint === DEFAULT_CHAT_COMPLETIONS_URL
+    ) {
+      endpointInput.value =
+        modeSelect.value === "chat-completions"
+          ? DEFAULT_CHAT_COMPLETIONS_URL
+          : DEFAULT_RESPONSES_URL;
+    }
+    updateTargetPreview();
   }
 
   function handleSuggestion(event) {
@@ -559,6 +755,8 @@ function mountAssistant(root) {
     button.addEventListener("click", () => setOpen(false)),
   );
   connectButton.addEventListener("click", handleConnect);
+  endpointInput.addEventListener("input", updateTargetPreview);
+  modeSelect.addEventListener("change", handleModeChange);
   form.addEventListener("submit", handleSubmit);
   input.addEventListener("keydown", handleInputKeydown);
   restartButton?.addEventListener("click", handleRestart);
@@ -569,7 +767,10 @@ function mountAssistant(root) {
   renderHistory();
   if (apiKey) {
     setConnected(true);
-    if (responseId && history.length) {
+    if (
+      history.length &&
+      (apiMode === "chat-completions" || Boolean(responseId))
+    ) {
       setStatus("已恢复本文在本标签页中的对话", "ready");
     } else {
       initializePaper();
