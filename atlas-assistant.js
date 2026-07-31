@@ -9,6 +9,9 @@ const DEFAULT_CHAT_COMPLETIONS_URL =
   "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MODEL = "gpt-5.6-terra";
 const DEFAULT_API_MODE = "responses";
+const RELAY_API_URL =
+  "https://agent-research-atlas-icml-2026.amajobs.chatgpt.site/api/ai-relay";
+const RELAYED_API_HOSTS = new Set(["api.sanaekochiya.org"]);
 
 const ASSISTANT_INSTRUCTIONS = [
   "你是严谨的学术论文阅读助手，默认使用中文回答。",
@@ -225,6 +228,24 @@ export function normalizeApiEndpoint(value) {
   return url.toString();
 }
 
+export function resolveApiTransport(endpoint) {
+  const normalizedEndpoint = normalizeApiEndpoint(endpoint);
+  const url = new URL(normalizedEndpoint);
+  if (RELAYED_API_HOSTS.has(url.hostname)) {
+    return {
+      requestUrl: RELAY_API_URL,
+      endpoint: normalizedEndpoint,
+      relayed: true,
+    };
+  }
+
+  return {
+    requestUrl: normalizedEndpoint,
+    endpoint: normalizedEndpoint,
+    relayed: false,
+  };
+}
+
 function readPaperContext(root) {
   const article = document.querySelector(".paper-article");
   const clone = article?.cloneNode(true);
@@ -291,6 +312,7 @@ function clearAtlasSession(storage) {
 }
 
 async function callModelApi(apiKey, endpoint, body, signal) {
+  const transport = resolveApiTransport(endpoint);
   const transportController = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => transportController.abort();
@@ -302,13 +324,15 @@ async function callModelApi(apiKey, endpoint, body, signal) {
 
   let response;
   try {
-    response = await fetch(endpoint, {
+    response = await fetch(transport.requestUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(
+        transport.relayed ? { endpoint: transport.endpoint, payload: body } : body,
+      ),
       signal: transportController.signal,
     });
   } catch (error) {
@@ -317,7 +341,9 @@ async function callModelApi(apiKey, endpoint, body, signal) {
     }
     if (signal?.aborted || error?.name === "AbortError") throw error;
     throw new Error(
-      "浏览器无法连接该 API。请检查 URL、网络和第三方服务的跨域设置。",
+      transport.relayed
+        ? "本站中转服务暂时无法连接，请稍后重试。"
+        : "浏览器无法连接该 API。请检查 URL、网络和第三方服务的跨域设置。",
     );
   } finally {
     window.clearTimeout(timeout);
@@ -421,7 +447,10 @@ function mountAssistant(root) {
   function endpointLabel() {
     try {
       const url = new URL(endpointInput.value.trim());
-      return `${url.host}${url.pathname}`;
+      const label = `${url.host}${url.pathname}`;
+      return RELAYED_API_HOSTS.has(url.hostname)
+        ? `本站受限中转 → ${label}`
+        : label;
     } catch {
       return "等待填写有效 URL";
     }
